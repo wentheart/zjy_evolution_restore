@@ -2,7 +2,7 @@
 import torch
 import numpy as np
 import logging
-from sklearn.metrics import accuracy_score, roc_auc_score
+from sklearn.metrics import accuracy_score, roc_auc_score, f1_score, confusion_matrix, precision_score, recall_score
 from scipy.stats import kendalltau, spearmanr
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -39,7 +39,8 @@ class Evaluator:
             
         Returns:
             accuracy: 准确率
-            auc: AUC得分
+            f1_macro: 宏平均F1分数
+            confusion: 混淆矩阵
         """
         self.logger.info("评估边对相对顺序预测准确率...")
         
@@ -52,7 +53,7 @@ class Evaluator:
         
         # 创建数据集
         edge_pairs = torch.tensor(edge_pairs, dtype=torch.long)
-        labels = torch.tensor(labels, dtype=torch.float)
+        labels = torch.tensor(labels, dtype=torch.long)
         dataset = TensorDataset(edge_pairs, labels)
         data_loader = DataLoader(dataset, batch_size=self.config.BATCH_SIZE)
         
@@ -64,8 +65,8 @@ class Evaluator:
                 edge_pair_batch = edge_pair_batch.to(self.device)
                 
                 # 获取边嵌入
-                edge1_idx = edge_pair_batch[:, 0]
-                edge2_idx = edge_pair_batch[:, 1]
+                edge1_idx = edge_pair_batch[:, 0].cpu()
+                edge2_idx = edge_pair_batch[:, 1].cpu()
                 
                 edge1 = test_edges[edge1_idx]
                 edge2 = test_edges[edge2_idx]
@@ -75,7 +76,8 @@ class Evaluator:
                 edge2_embedding = self.contrastive_model.encode_edges(edge_index, edge2)
                 
                 # 预测顺序
-                pred = self.discriminator_model(edge1_embedding, edge2_embedding)
+                logits = self.discriminator_model(edge1_embedding, edge2_embedding)
+                _, pred = torch.max(logits, 1)
                 
                 all_preds.extend(pred.cpu().numpy())
                 all_labels.extend(label_batch.numpy())
@@ -84,14 +86,22 @@ class Evaluator:
         all_preds = np.array(all_preds)
         all_labels = np.array(all_labels)
         
-        pred_labels = (all_preds > 0.5).astype(int)
-        accuracy = accuracy_score(all_labels, pred_labels)
-        auc = roc_auc_score(all_labels, all_preds)
+        accuracy = accuracy_score(all_labels, all_preds)
+        f1_macro = f1_score(all_labels, all_preds, average='macro')
+        confusion = confusion_matrix(all_labels, all_preds)
         
         self.logger.info(f"边对预测准确率: {accuracy:.4f}")
-        self.logger.info(f"边对预测AUC: {auc:.4f}")
+        self.logger.info(f"边对预测宏平均F1分数: {f1_macro:.4f}")
+        self.logger.info(f"混淆矩阵:\n{confusion}")
         
-        return accuracy, auc
+        # 计算每个类别的精确率和召回率
+        precision = precision_score(all_labels, all_preds, average=None)
+        recall = recall_score(all_labels, all_preds, average=None)
+        
+        self.logger.info(f"各类别精确率: 早于或同时={precision[0]:.4f}, 晚于={precision[1]:.4f}")
+        self.logger.info(f"各类别召回率: 早于或同时={recall[0]:.4f}, 晚于={recall[1]:.4f}")
+        
+        return accuracy, f1_macro, confusion
         
     def evaluate_ranking_correlation(self, predictor, test_edges, test_times):
         """评估预测的边生成顺序与真实顺序的相关性
@@ -132,7 +142,7 @@ class Evaluator:
         
         return kendall, spearman
         
-    def visualize_predictions(self, predictor, test_edges, test_times, num_samples=20):
+    def visualize_predictions(self, predictor, test_edges, test_times, num_samples=50):
         """可视化部分预测结果
         
         Args:
@@ -161,31 +171,51 @@ class Evaluator:
                     
                 edge2_tuple = tuple(edge2)
                 
-                # 预测edge1是否早于edge2
-                pred_probability = predictor.predict_pairwise_order(edge1, edge2)
-                
-                # 真实情况
-                true_result = 1 if sample_times[i] < sample_times[j] else 0
+                # 计算真实关系（二分类）
+                time_diff = sample_times[i] - sample_times[j]
+
+                if abs(time_diff) > predictor.config.TIME_THRESHOLD:
+                    if time_diff < -predictor.config.TIME_THRESHOLD:
+                        true_relation = 1  # edge1晚于edge2
+                    else:
+                        true_relation = 0  # edge1早于或同时于edge2
+                    
+                # 预测edge1与edge2的关系
+                pred_relation, probabilities = predictor.predict_pairwise_order(edge1, edge2)
                 
                 results.append({
                     'edge1': edge1_tuple,
                     'edge2': edge2_tuple,
                     'true_time1': sample_times[i],
                     'true_time2': sample_times[j],
-                    'true_result': true_result,
-                    'pred_probability': pred_probability,
-                    'pred_result': 1 if pred_probability > 0.5 else 0,
-                    'correct': (true_result == (1 if pred_probability > 0.5 else 0))
+                    'true_relation': true_relation,
+                    'pred_relation': pred_relation,
+                    'probabilities': probabilities,
+                    'correct': (true_relation == pred_relation)
                 })
         
         # 打印结果
         self.logger.info("边对预测结果示例:")
-        for i, result in enumerate(results[:10]):  # 只显示前10个
+        for i, result in enumerate(results[:50]):  # 只显示前10个
             self.logger.info(f"样本 {i+1}:")
             self.logger.info(f"  边1: {result['edge1']}, 时间: {result['true_time1']}")
             self.logger.info(f"  边2: {result['edge2']}, 时间: {result['true_time2']}")
-            self.logger.info(f"  真实结果: {'边1早于边2' if result['true_result'] == 1 else '边2早于边1'}")
-            self.logger.info(f"  预测概率: {result['pred_probability']:.4f}")
-            self.logger.info(f"  预测结果: {'边1早于边2' if result['pred_result'] == 1 else '边2早于边1'}")
+            
+            # 显示真实关系
+            if result['true_relation'] == 1:
+                true_rel_text = "边1晚于边2"
+            else:
+                true_rel_text = "边1早于或同时于边2"
+                
+            # 显示预测关系
+            if result['pred_relation'] == 1:
+                pred_rel_text = "边1晚于边2"
+            else:
+                pred_rel_text = "边1早于或同时于边2"
+                
+            self.logger.info(f"  真实关系: {true_rel_text}")
+            self.logger.info(f"  预测关系: {pred_rel_text}")
+            self.logger.info(f"  预测概率: 早于或同时={result['probabilities'][0]:.4f}, "
+                            f"晚于={result['probabilities'][1]:.4f}")
             self.logger.info(f"  是否正确: {'✓' if result['correct'] else '✗'}")
             self.logger.info("")

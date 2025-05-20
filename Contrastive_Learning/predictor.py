@@ -50,7 +50,8 @@ class OrderPredictor:
             edge2: 第二条边 (node1, node2)
             
         Returns:
-            probability: edge1早于edge2生成的概率
+            relation: 边的关系 (0表示edge1早于或同时于edge2, 1表示edge1晚于edge2)
+            probabilities: 两个类别的概率分布
         """
         with torch.no_grad():
             # 获取或计算边嵌入
@@ -71,9 +72,14 @@ class OrderPredictor:
                 self.edge_embeddings_cache[edge2_tuple] = edge2_embedding
             
             # 预测顺序
-            probability = self.discriminator_model(edge1_embedding, edge2_embedding).item()
+            logits = self.discriminator_model(edge1_embedding, edge2_embedding)
+            probabilities = torch.softmax(logits, dim=1).detach().cpu().numpy()[0]
             
-        return probability
+            # 获取最可能的关系
+            pred_class = np.argmax(probabilities)
+            relation = pred_class  # 直接使用类别作为关系 (0或1)
+            
+        return relation, probabilities
         
     def predict_all_pairwise_orders(self, edges):
         """预测所有边对之间的相对顺序
@@ -82,7 +88,9 @@ class OrderPredictor:
             edges: 边列表
             
         Returns:
-            order_matrix: 顺序矩阵，order_matrix[i, j] = 1表示边i早于边j
+            order_matrix: 顺序矩阵，order_matrix[i, j] = 
+                - 0表示边i早于或同时于边j
+                - 1表示边i晚于边j
         """
         n_edges = len(edges)
         self.logger.info(f"预测 {n_edges} 条边的所有相对顺序...")
@@ -113,14 +121,16 @@ class OrderPredictor:
                 expanded_embedding = edge_i_embedding.expand(len(batch_edges), -1)
                 
                 # 预测概率
-                probabilities = self.discriminator_model(expanded_embedding, batch_embeddings).cpu().numpy()
+                logits = self.discriminator_model(expanded_embedding, batch_embeddings)
+                probs = torch.softmax(logits, dim=1).detach().cpu().numpy()
                 
                 # 填充顺序矩阵
-                for k, prob in enumerate(probabilities):
+                for k, prob in enumerate(probs):
                     idx = j + k
                     if i != idx:  # 跳过自身
-                        # edge_i早于edge_j的概率大于0.5，则认为edge_i早于edge_j
-                        order_matrix[i, idx] = 1 if prob > 0.5 else 0
+                        pred_class = np.argmax(prob)
+                        # 直接使用预测的类别
+                        order_matrix[i, idx] = pred_class
         
         return order_matrix
         
@@ -139,19 +149,21 @@ class OrderPredictor:
         # 添加节点
         G.add_nodes_from(range(n))
         
-        # 添加有向边
+        # 添加有向边：只有当edge_i早于edge_j时添加从i到j的边
         for i in range(n):
             for j in range(n):
-                if i != j and order_matrix[i, j] == 1:
+                if i != j and order_matrix[i, j] == 0 and order_matrix[j, i] == 1:
+                    # i早于j
                     G.add_edge(i, j)
         
         return G
         
-    def resolve_contradictions(self, order_matrix):
+    def resolve_contradictions(self, order_matrix, edges):
         """解决顺序矩阵中的矛盾
         
         Args:
             order_matrix: 顺序矩阵
+            edges: 边列表，与顺序矩阵的索引对应
             
         Returns:
             resolved_matrix: 解决矛盾后的顺序矩阵
@@ -163,25 +175,25 @@ class OrderPredictor:
         for i in range(n):
             for j in range(n):
                 if i != j:
-                    # 如果i早于j且j早于i，则矛盾
+                    # 如果存在互相矛盾的顺序（i晚于j，但j也晚于i）
                     if resolved_matrix[i, j] == 1 and resolved_matrix[j, i] == 1:
                         # 根据概率值解决矛盾
-                        prob_i_j = self.predict_pairwise_order(i, j)
-                        prob_j_i = 1 - prob_i_j
+                        edge_i = edges[i]
+                        edge_j = edges[j]
+                        relation, probabilities = self.predict_pairwise_order(edge_i, edge_j)
                         
-                        # 保留概率较高的顺序
-                        if prob_i_j >= prob_j_i:
-                            resolved_matrix[j, i] = 0
-                        else:
-                            resolved_matrix[i, j] = 0
+                        # 根据概率最高的关系解决矛盾
+                        resolved_matrix[i, j] = relation
+                        resolved_matrix[j, i] = 1 - relation  # 相反的关系
         
         return resolved_matrix
         
-    def topological_sort(self, order_matrix):
+    def topological_sort(self, order_matrix, edges):
         """根据顺序矩阵进行拓扑排序
         
         Args:
             order_matrix: 顺序矩阵
+            edges: 边列表，与顺序矩阵的索引对应
             
         Returns:
             sorted_indices: 排序后的边索引
@@ -196,7 +208,7 @@ class OrderPredictor:
         else:
             # 如果有环，解决矛盾
             self.logger.info("优先级图中存在环，尝试解决矛盾...")
-            resolved_matrix = self.resolve_contradictions(order_matrix)
+            resolved_matrix = self.resolve_contradictions(order_matrix, edges)
             G = self.build_precedence_graph(resolved_matrix)
             
             # 再次检查是否有环
@@ -264,7 +276,7 @@ class OrderPredictor:
         order_matrix = self.predict_all_pairwise_orders(edges)
         
         # 拓扑排序
-        sorted_indices = self.topological_sort(order_matrix)
+        sorted_indices = self.topological_sort(order_matrix, edges)
         
         # 获取排序后的边
         ordered_edges = [edges[i] for i in sorted_indices]

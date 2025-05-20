@@ -23,6 +23,7 @@ class ContrastiveLoss(nn.Module):
         Returns:
             loss: 对比损失
         """
+
         # 计算正样本相似度
         pos_similarity = torch.sum(anchor * positive, dim=1) / self.temperature
         
@@ -69,7 +70,7 @@ class Trainer:
         
         # 损失函数
         self.contrastive_loss_fn = ContrastiveLoss(temperature=config.TEMPERATURE)
-        self.discriminator_loss_fn = nn.BCELoss()
+        self.discriminator_loss_fn = nn.CrossEntropyLoss()  # 修改为CrossEntropyLoss
         
         # 日志
         self.logger = logging.getLogger(__name__)
@@ -92,7 +93,6 @@ class Trainer:
         edge_index = pyg_data.edge_index.to(self.device)
         
         best_loss = float('inf')
-        patience_counter = 0
         
         for epoch in range(self.config.CONTRASTIVE_EPOCHS):
             start_time = time.time()
@@ -134,8 +134,13 @@ class Trainer:
                     negative_embs = self.contrastive_model(edge_index, negative_edges)
                     negative_embs_list.append(negative_embs)
                 
+                
                 # 堆叠负样本 [batch_size, num_neg, dim]
-                negative_embs_stacked = torch.stack(negative_embs_list, dim=1)
+                negative_embs_stacked = torch.stack(negative_embs_list,dim=0)
+
+                if negative_embs_stacked.shape[0] != anchor_embs.shape[0] and negative_embs_stacked.dim() == 3:
+                    negative_embs_stacked = negative_embs_stacked.permute(1, 0, 2)
+                    print("negative_embs_stacked.shape after permute:", negative_embs_stacked.shape)
                 
                 # 计算损失
                 loss = self.contrastive_loss_fn(anchor_embs, positive_embs, negative_embs_stacked)
@@ -156,20 +161,13 @@ class Trainer:
                     data_loader, val_edges, val_times, edge_index
                 )
                 
-                # 早停检查
+                # 只保存最佳模型，不进行早停
                 if val_loss < best_loss:
                     best_loss = val_loss
-                    patience_counter = 0
                     
                     # 保存最佳模型
                     torch.save(self.contrastive_model.state_dict(), self.config.CONTRASTIVE_MODEL_PATH)
-                    self.logger.info(f"模型已保存到 {self.config.CONTRASTIVE_MODEL_PATH}")
-                else:
-                    patience_counter += 1
-                    
-                if patience_counter >= self.config.PATIENCE:
-                    self.logger.info(f"早停: {self.config.PATIENCE} 轮验证损失未改善")
-                    break
+                    self.logger.info(f"发现更优模型，已保存到 {self.config.CONTRASTIVE_MODEL_PATH}")
             
             epoch_time = time.time() - start_time
             self.logger.info(f"Epoch {epoch+1}/{self.config.CONTRASTIVE_EPOCHS} - "
@@ -181,7 +179,7 @@ class Trainer:
         if val_edges is None or val_times is None:
             torch.save(self.contrastive_model.state_dict(), self.config.CONTRASTIVE_MODEL_PATH)
             
-        self.logger.info("对比学习模型训练完成")
+        self.logger.info(f"对比学习模型训练完成，最佳验证损失: {best_loss:.4f}")
         
     def _validate_contrastive(self, data_loader, val_edges, val_times, edge_index):
         """验证对比学习模型
@@ -233,7 +231,7 @@ class Trainer:
                     negative_embs_list.append(negative_embs)
                 
                 # 堆叠负样本
-                negative_embs_stacked = torch.stack(negative_embs_list, dim=1)
+                negative_embs_stacked = torch.stack(negative_embs_list, dim=0)
                 
                 # 计算损失
                 loss = self.contrastive_loss_fn(anchor_embs, positive_embs, negative_embs_stacked)
@@ -244,8 +242,7 @@ class Trainer:
             
         return avg_loss
     
-    def train_discriminator(self, data_loader, train_edges, train_times,
-                          val_edges=None, val_times=None):
+    def train_discriminator(self, data_loader, train_edges, train_times, val_edges=None, val_times=None):
         """训练边序判别器
         
         Args:
@@ -270,23 +267,22 @@ class Trainer:
         # 生成边对数据
         edge_pairs, labels = data_loader.generate_order_pairs(train_edges, train_times)
         
-        # 创建数据集
+        # 创建数据集 - 使用不同名称
         edge_pairs = torch.tensor(edge_pairs, dtype=torch.long)
-        labels = torch.tensor(labels, dtype=torch.float)
+        labels = torch.tensor(labels, dtype=torch.long)  # 修改为long类型
         dataset = TensorDataset(edge_pairs, labels)
-        data_loader = DataLoader(dataset, batch_size=self.config.BATCH_SIZE, shuffle=True)
+        train_loader = DataLoader(dataset, batch_size=self.config.BATCH_SIZE, shuffle=True)
         
         # 如果有验证集，生成验证数据
         val_loader = None
         if val_edges is not None and val_times is not None:
             val_edge_pairs, val_labels = data_loader.generate_order_pairs(val_edges, val_times)
             val_edge_pairs = torch.tensor(val_edge_pairs, dtype=torch.long)
-            val_labels = torch.tensor(val_labels, dtype=torch.float)
+            val_labels = torch.tensor(val_labels, dtype=torch.long)  # 修改为long类型
             val_dataset = TensorDataset(val_edge_pairs, val_labels)
             val_loader = DataLoader(val_dataset, batch_size=self.config.BATCH_SIZE)
         
         best_val_acc = 0.0
-        patience_counter = 0
         
         for epoch in range(self.config.DISCRIMINATOR_EPOCHS):
             start_time = time.time()
@@ -298,13 +294,17 @@ class Trainer:
             correct = 0
             total = 0
             
-            for edge_pair_batch, label_batch in data_loader:
+            # 使用train_loader进行迭代
+            for edge_pair_batch, label_batch in train_loader:
                 edge_pair_batch = edge_pair_batch.to(self.device)
                 label_batch = label_batch.to(self.device)
                 
                 # 获取边嵌入
                 edge1_idx = edge_pair_batch[:, 0]
                 edge2_idx = edge_pair_batch[:, 1]
+
+                edge1_idx = edge1_idx.cpu()
+                edge2_idx = edge2_idx.cpu()
                 
                 edge1 = train_edges[edge1_idx]
                 edge2 = train_edges[edge2_idx]
@@ -315,10 +315,10 @@ class Trainer:
                     edge2_embedding = self.contrastive_model.encode_edges(edge_index, edge2)
                 
                 # 预测顺序
-                pred = self.discriminator_model(edge1_embedding, edge2_embedding)
+                logits = self.discriminator_model(edge1_embedding, edge2_embedding)
                 
                 # 计算损失
-                loss = self.discriminator_loss_fn(pred, label_batch)
+                loss = self.discriminator_loss_fn(logits, label_batch)
                 
                 # 反向传播
                 self.discriminator_optimizer.zero_grad()
@@ -328,11 +328,11 @@ class Trainer:
                 total_loss += loss.item()
                 
                 # 计算准确率
-                pred_labels = (pred > 0.5).float()
+                _, pred_labels = torch.max(logits, 1)
                 correct += (pred_labels == label_batch).sum().item()
                 total += label_batch.size(0)
             
-            avg_loss = total_loss / len(data_loader)
+            avg_loss = total_loss / len(train_loader)
             train_acc = correct / total
             
             # 验证
@@ -340,20 +340,13 @@ class Trainer:
             if val_loader is not None:
                 val_acc = self._validate_discriminator(val_loader, val_edges, edge_index)
                 
-                # 早停检查
+                # 只保存最佳模型，不进行早停
                 if val_acc > best_val_acc:
                     best_val_acc = val_acc
-                    patience_counter = 0
                     
                     # 保存最佳模型
                     torch.save(self.discriminator_model.state_dict(), self.config.DISCRIMINATOR_MODEL_PATH)
-                    self.logger.info(f"模型已保存到 {self.config.DISCRIMINATOR_MODEL_PATH}")
-                else:
-                    patience_counter += 1
-                    
-                if patience_counter >= self.config.PATIENCE:
-                    self.logger.info(f"早停: {self.config.PATIENCE} 轮验证准确率未改善")
-                    break
+                    self.logger.info(f"发现更优模型，已保存到 {self.config.DISCRIMINATOR_MODEL_PATH}")
             
             epoch_time = time.time() - start_time
             self.logger.info(f"Epoch {epoch+1}/{self.config.DISCRIMINATOR_EPOCHS} - "
@@ -361,12 +354,12 @@ class Trainer:
                              f"Train Acc: {train_acc:.4f} - "
                              f"Val Acc: {val_acc:.4f} - "
                              f"Time: {epoch_time:.2f}s")
-            
+        
         # 如果没有验证集，保存最后一轮的模型
         if val_loader is None:
             torch.save(self.discriminator_model.state_dict(), self.config.DISCRIMINATOR_MODEL_PATH)
             
-        self.logger.info("边序判别器训练完成")
+        self.logger.info(f"边序判别器训练完成，最佳验证准确率: {best_val_acc:.4f}")
         
     def _validate_discriminator(self, val_loader, val_edges, edge_index):
         """验证边序判别器
@@ -390,8 +383,8 @@ class Trainer:
                 label_batch = label_batch.to(self.device)
                 
                 # 获取边嵌入
-                edge1_idx = edge_pair_batch[:, 0]
-                edge2_idx = edge_pair_batch[:, 1]
+                edge1_idx = edge_pair_batch[:, 0].cpu()
+                edge2_idx = edge_pair_batch[:, 1].cpu()
                 
                 edge1 = val_edges[edge1_idx]
                 edge2 = val_edges[edge2_idx]
@@ -401,10 +394,10 @@ class Trainer:
                 edge2_embedding = self.contrastive_model.encode_edges(edge_index, edge2)
                 
                 # 预测顺序
-                pred = self.discriminator_model(edge1_embedding, edge2_embedding)
+                logits = self.discriminator_model(edge1_embedding, edge2_embedding)
                 
                 # 计算准确率
-                pred_labels = (pred > 0.5).float()
+                _, pred_labels = torch.max(logits, 1)
                 correct += (pred_labels == label_batch).sum().item()
                 total += label_batch.size(0)
         

@@ -124,24 +124,25 @@ class EdgeOrderDiscriminator(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-            nn.Sigmoid()
+            nn.Linear(hidden_dim, 2)  # 修改为2个类别，表示二分类
         )
         
     def forward(self, edge1_embedding, edge2_embedding):
-        """判断edge1是否早于edge2生成
+        """判断edge1与edge2的时序关系
         
         Args:
             edge1_embedding: 第一条边的表示向量 [batch_size, embedding_dim]
             edge2_embedding: 第二条边的表示向量 [batch_size, embedding_dim]
             
         Returns:
-            probability: edge1早于edge2生成的概率 [batch_size]
+            logits: 二分类的得分 [batch_size, 2]
+            - idx 0: edge1早于或同时于edge2生成的得分(0)
+            - idx 1: edge1晚于edge2生成的得分(1)
         """
         # 拼接两条边的嵌入
         features = torch.cat([edge1_embedding, edge2_embedding], dim=1)
         
-        # 预测概率
-        probability = self.mlp(features).squeeze(1)
+        # 预测二分类概率
+        logits = self.mlp(features)
         
-        return probability
+        return logits

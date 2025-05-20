@@ -165,26 +165,33 @@ class EdgeDataLoader:
             
         Returns:
             edge_pairs: 边对索引 [(idx1, idx2), ...]
-            labels: 标签 [1 if edges[idx1]早于edges[idx2]生成 else 0, ...]
+            labels: 标签
+                - 0: edge1早于或同时于edge2生成
+                - 1: edge1晚于edge2生成
         """
         n_edges = len(edges)
         edge_pairs = []
         labels = []
         
-        # 生成一定数量的边对
-        num_pairs = min(10000, n_edges * 5)  # 限制对的数量
-        
-        for _ in range(num_pairs):
-            # 随机选择两条不同的边
-            i, j = random.sample(range(n_edges), 2)
-            
-            edge_pairs.append((i, j))
-            
-            # 如果edge_i的时间早于edge_j，标签为1，否则为0
-            if times[i] < times[j]:
-                labels.append(1)
-            else:
-                labels.append(0)
+        # 使用双重循环遍历所有可能的边对，内部循环从i+1开始避免重复
+        for i in range(n_edges):
+            for j in range(i+1, n_edges):  # 从i+1开始避免重复边对
+                # 计算时间差
+                time_diff = times[i] - times[j]
+                
+                # 只保留时间差大于阈值的边对（确保边的生成时间确实不同）
+                if time_diff == 0:
+                    continue
+                else:
+                    edge_pairs.append((i, j))
+                    
+                    # 二分类:
+                    # 1. 如果i的时间晚于j（考虑阈值），标签为1 (i晚于j)
+                    # 2. 否则标签为0 (i早于或同时于j)
+                    if time_diff < -self.time_threshold:
+                        labels.append(1)  # edge1晚于edge2
+                    else:
+                        labels.append(0)  # edge1早于或同时于edge2
         
         return edge_pairs, labels
         
